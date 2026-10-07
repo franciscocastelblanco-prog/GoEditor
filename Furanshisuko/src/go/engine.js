@@ -2,11 +2,6 @@ export const EMPTY = 0;
 export const BLACK = 1;
 export const WHITE = 2;
 
-const PLAYER_COLOR = [
-  [BLACK, '#1a1a1a'],
-  [WHITE, '#f0f0f0'],
-];
-
 function neighbors(r, c, size) {
   const n = [];
   if (r > 0) n.push([r - 1, c]);
@@ -31,7 +26,7 @@ export function starPoints(size) {
 
 function groupOnBoard(board, r, c, size) {
   const color = board[r][c];
-  if (color === EMPTY) return { stonesArr: [], libertiesArr: [] };
+  if (color === EMPTY) return { stonesArr: [], libCount: 0 };
   const stones = [];
   const liberties = new Set();
   const seen = Array.from({ length: size }, () => new Array(size).fill(false));
@@ -50,15 +45,39 @@ function groupOnBoard(board, r, c, size) {
       }
     }
   }
-  return {
-    stonesArr: stones,
-    libertiesArr: [...liberties].map((s) => s.split(',').map(Number)),
-    libCount: liberties.size,
-  };
+  return { stonesArr: stones, libCount: liberties.size };
 }
 
-function signature(board, size) {
+function signature(board) {
   return board.map((row) => row.join('')).join('|');
+}
+
+export function moveResult(board, r, c, color, size) {
+  if (board[r][c] !== EMPTY) {
+    return { legal: false, reason: 'occupied', board, captured: [], sig: signature(board) };
+  }
+  const b = board.map((row) => row.slice());
+  const opponent = color === BLACK ? WHITE : BLACK;
+  b[r][c] = color;
+  const checked = Array.from({ length: size }, () => new Array(size).fill(false));
+  const captured = [];
+  for (const [nr, nc] of neighbors(r, c, size)) {
+    if (b[nr][nc] === opponent && !checked[nr][nc]) {
+      const g = groupOnBoard(b, nr, nc, size);
+      for (const [sr, sc] of g.stonesArr) checked[sr][sc] = true;
+      if (g.libCount === 0) {
+        for (const [sr, sc] of g.stonesArr) {
+          b[sr][sc] = EMPTY;
+          captured.push([sr, sc]);
+        }
+      }
+    }
+  }
+  const myGroup = groupOnBoard(b, r, c, size);
+  if (myGroup.libCount === 0) {
+    return { legal: false, reason: 'suicide', board: b, captured, sig: signature(b) };
+  }
+  return { legal: true, reason: null, board: b, captured, sig: signature(b) };
 }
 
 export class GoEngine {
@@ -66,6 +85,7 @@ export class GoEngine {
     this.size = size;
     this.komi = komi;
     this.superkoEnabled = superko;
+    this.mode = 'edit';
     this.reset();
   }
 
@@ -75,18 +95,27 @@ export class GoEngine {
     );
     this.turn = BLACK;
     this.prisoners = { [BLACK]: 0, [WHITE]: 0 };
-    this.history = [signature(this.board, this.size)];
-    this.moveHistory = [];
+    this.history = [signature(this.board)];
     this.lastMove = null;
     this.passes = 0;
     this.gameOver = false;
-    this.editStones = [];
-    this.snapshot(0);
+    this.moveHistory = [this._snapshot()];
+    this._cursor = 0;
   }
 
-  snapshot(index) {
-    if (index === undefined) return;
-    this.moveHistory[index] = {
+  beginPlay() {
+    this.turn = BLACK;
+    this.prisoners = { [BLACK]: 0, [WHITE]: 0 };
+    this.lastMove = null;
+    this.passes = 0;
+    this.gameOver = false;
+    this.history = [signature(this.board)];
+    this.moveHistory = [this._snapshot()];
+    this._cursor = 0;
+  }
+
+  _snapshot() {
+    return {
       board: this.board.map((row) => row.slice()),
       turn: this.turn,
       prisoners: { [BLACK]: this.prisoners[BLACK], [WHITE]: this.prisoners[WHITE] },
@@ -94,50 +123,33 @@ export class GoEngine {
       lastMove: this.lastMove ? { ...this.lastMove } : null,
       passes: this.passes,
       gameOver: this.gameOver,
-      editStones: this.editStones.slice(),
     };
   }
 
+  _commit() {
+    this.moveHistory = this.moveHistory.slice(0, this._cursor + 1);
+    this.moveHistory.push(this._snapshot());
+    this._cursor = this.moveHistory.length - 1;
+  }
+
   get canUndo() {
-    return this.moveHistory.length > 1;
+    return this._cursor > 0;
   }
   get canRedo() {
     return this._cursor < this.moveHistory.length - 1;
   }
 
+  opponentOf(player) {
+    return player === BLACK ? WHITE : BLACK;
+  }
+
   _computeMove(r, c, player) {
-    const b = this.board.map((row) => row.slice());
-    const opponent = player === BLACK ? WHITE : BLACK;
-    b[r][c] = player;
-    const checked = Array.from({ length: this.size }, () =>
-      new Array(this.size).fill(false),
-    );
-    const captured = [];
-    for (const [nr, nc] of neighbors(r, c, this.size)) {
-      if (b[nr][nc] === opponent && !checked[nr][nc]) {
-        const g = groupOnBoard(b, nr, nc, this.size);
-        for (const [sr, sc] of g.stonesArr) checked[sr][sc] = true;
-        if (g.libCount === 0) {
-          for (const [sr, sc] of g.stonesArr) {
-            b[sr][sc] = EMPTY;
-            captured.push([sr, sc]);
-          }
-        }
-      }
+    const res = moveResult(this.board, r, c, player, this.size);
+    if (!res.legal) return res;
+    if (this.superkoEnabled && this.history.includes(res.sig)) {
+      return { legal: false, reason: 'superko', board: res.board, captured: res.captured, sig: res.sig };
     }
-    const myGroup = groupOnBoard(b, r, c, this.size);
-    let legal = true;
-    let reason = null;
-    if (myGroup.libCount === 0) {
-      legal = false;
-      reason = 'suicide';
-    }
-    const sig = signature(b, this.size);
-    if (this.superkoEnabled && legal && this.history.includes(sig)) {
-      legal = false;
-      reason = 'superko';
-    }
-    return { legal, reason, board: b, captured, sig };
+    return res;
   }
 
   playMove(r, c) {
@@ -152,55 +164,47 @@ export class GoEngine {
     this.history.push(res.sig);
     this.lastMove = { r, c };
     this.passes = 0;
-    this.turn = this.turn === BLACK ? WHITE : BLACK;
-    this.moveHistory.push({
-      board: this.board.map((row) => row.slice()),
-      turn: this.turn,
-      prisoners: { [BLACK]: this.prisoners[BLACK], [WHITE]: this.prisoners[WHITE] },
-      history: this.history.slice(),
-      lastMove: this.lastMove ? { ...this.lastMove } : null,
-      passes: this.passes,
-      gameOver: this.gameOver,
-      editStones: this.editStones.slice(),
-    });
-    this._cursor = this.moveHistory.length - 1;
+    this.turn = this.opponentOf(this.turn);
+    this._commit();
     return { legal: true, captured: res.captured, sig: res.sig };
   }
 
   pass() {
     if (this.gameOver) return { legal: false, reason: 'game-over' };
     this.passes += 1;
-    this.turn = this.turn === BLACK ? WHITE : BLACK;
+    this.turn = this.opponentOf(this.turn);
     if (this.passes >= 2) this.gameOver = true;
-    this.moveHistory.push({
-      board: this.board.map((row) => row.slice()),
-      turn: this.turn,
-      prisoners: { [BLACK]: this.prisoners[BLACK], [WHITE]: this.prisoners[WHITE] },
-      history: this.history.slice(),
-      lastMove: null,
-      passes: this.passes,
-      gameOver: this.gameOver,
-      editStones: this.editStones.slice(),
-    });
-    this._cursor = this.moveHistory.length - 1;
+    this._commit();
     return { legal: true, gameOver: this.gameOver };
   }
 
   canMove(r, c) {
     if (this.board[r][c] !== EMPTY) return { legal: false, reason: 'occupied' };
     const res = this._computeMove(r, c, this.turn);
-    return { legal: res.legal, reason: res.reason };
+    return { legal: res.legal, reason: res.reason, captured: res.captured };
+  }
+
+  legalMoves(color) {
+    const sz = this.size;
+    const moves = [];
+    for (let r = 0; r < sz; r++) {
+      for (let c = 0; c < sz; c++) {
+        if (this.board[r][c] !== EMPTY) continue;
+        const res = this._computeMove(r, c, color);
+        if (res.legal) moves.push({ r, c, captured: res.captured.length });
+      }
+    }
+    return moves;
   }
 
   undo() {
-    if (!this.canUndo) return false;
-    const prev = this._cursor - 1;
-    this._restore(prev);
+    if (this._cursor <= 0) return false;
+    this._restore(this._cursor - 1);
     return true;
   }
 
   redo() {
-    if (!this.canRedo) return false;
+    if (this._cursor >= this.moveHistory.length - 1) return false;
     this._restore(this._cursor + 1);
     return true;
   }
@@ -214,23 +218,7 @@ export class GoEngine {
     this.lastMove = s.lastMove ? { ...s.lastMove } : null;
     this.passes = s.passes;
     this.gameOver = s.gameOver;
-    this.editStones = s.editStones.slice();
     this._cursor = index;
-  }
-
-  get state() {
-    return {
-      board: this.board,
-      size: this.size,
-      turn: this.turn,
-      prisoners: this.prisoners,
-      lastMove: this.lastMove,
-      gameOver: this.gameOver,
-      passes: this.passes,
-      canUndo: this.canUndo,
-      canRedo: this.canRedo,
-      editStones: this.editStones,
-    };
   }
 
   placeEditStone(r, c, color) {
@@ -252,6 +240,20 @@ export class GoEngine {
 
   setSuperko(on) {
     this.superkoEnabled = on;
+  }
+
+  get state() {
+    return {
+      board: this.board,
+      size: this.size,
+      turn: this.turn,
+      prisoners: this.prisoners,
+      lastMove: this.lastMove,
+      gameOver: this.gameOver,
+      passes: this.passes,
+      canUndo: this.canUndo,
+      canRedo: this.canRedo,
+    };
   }
 
   score(deadStones = []) {
@@ -310,7 +312,12 @@ export class GoEngine {
     }
     const blackScore = blackTerr + prisoners[BLACK];
     const whiteScore = whiteTerr + prisoners[WHITE] + this.komi;
-    const winner = blackScore > whiteScore ? BLACK : whiteScore > blackScore ? WHITE : null;
+    const winner =
+      blackScore > whiteScore
+        ? BLACK
+        : whiteScore > blackScore
+          ? WHITE
+          : null;
     return {
       black: blackScore,
       white: whiteScore,
@@ -327,7 +334,6 @@ export class GoEngine {
   }
 }
 
-GoEngine.PLAYER_COLOR = PLAYER_COLOR;
 GoEngine.BLACK = BLACK;
 GoEngine.WHITE = WHITE;
 GoEngine.EMPTY = EMPTY;

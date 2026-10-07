@@ -13,6 +13,6 @@ const engine = new GoEngine(19, 6.5, true);
 const renderer = new CanvasRenderer(canvas, engine);
 const editor = new GoEditor(engine, renderer, app);
 
-renderer.draw();
+editor.render();
 
 export { editor };

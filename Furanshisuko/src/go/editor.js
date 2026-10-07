@@ -1,10 +1,9 @@
 import { EMPTY, BLACK, WHITE } from './engine.js';
-
-const MODES = ['edit', 'play', 'scoring'];
+import { selectMove } from './ai.js';
 
 const COLOR_NAMES = { [BLACK]: 'Black', [WHITE]: 'White' };
 
-function el(tag, props = {}, ...children) => {
+const el = (tag, props = {}, ...children) => {
   const e = document.createElement(tag);
   for (const [k, v] of Object.entries(props)) {
     if (k === 'class') e.className = v;
@@ -27,6 +26,9 @@ export class GoEditor {
     this.mode = 'edit';
     this.engine.mode = this.mode;
     this.editColor = BLACK;
+    this.humanColor = BLACK;
+    this.aiEnabled = true;
+    this._aiScheduled = false;
     this.renderer.deadStones = [];
     this.renderer.engine.mode = this.mode;
 
@@ -72,13 +74,13 @@ export class GoEditor {
 
     const rulesWrap = el('div', { class: 'go-field' });
     rulesWrap.appendChild(el('span', { class: 'go-field-label' }, 'Superko'));
-    rulesWrap.appendChild(
-      el('button', {
-        class: 'go-toggle',
-        'data-on': String(this.engine.superkoEnabled),
-        onclick: () => this.toggleSuperko(),
-      }, () => this.engine.superkoEnabled ? 'ON' : 'OFF'),
-    );
+    this.superBtn = el('button', {
+      class: 'go-toggle',
+      'data-on': String(this.engine.superkoEnabled),
+      html: this.engine.superkoEnabled ? 'ON' : 'OFF',
+      onclick: () => this.toggleSuperko(),
+    });
+    rulesWrap.appendChild(this.superBtn);
     bar.appendChild(rulesWrap);
 
     bar.appendChild(
@@ -90,6 +92,10 @@ export class GoEditor {
     bar.appendChild(
       el('button', { class: 'go-btn go-pass', onclick: () => this.pass() }, 'Pass'),
     );
+    this.humanBtn = el('button', { class: 'go-btn go-human', onclick: () => this.toggleHumanColor() }, this._humanLabel());
+    bar.appendChild(this.humanBtn);
+    this.aiBtn = el('button', { class: 'go-btn go-ai', 'data-on': String(this.aiEnabled), onclick: () => this.toggleAI() }, this._aiLabel());
+    bar.appendChild(this.aiBtn);
     bar.appendChild(
       el('button', { class: 'go-btn go-reset', onclick: () => this.reset() }, 'Reset'),
     );
@@ -182,9 +188,12 @@ export class GoEditor {
       this._render();
     } else if (this.mode === 'play') {
       if (this.engine.gameOver) return;
+      if (this.engine.turn !== this.humanColor) return;
       const res = this.engine.playMove(r, c);
       if (!res.legal) {
         this._flashReason(res.reason);
+      } else {
+        this._afterHumanAction();
       }
       this._render();
     } else if (this.mode === 'scoring') {
@@ -212,15 +221,25 @@ export class GoEditor {
   }
 
   setMode(mode) {
+    if (mode === 'scoring' && !this.engine.gameOver) {
+      this.statusEl.textContent =
+        'Finish the game (two passes) before scoring.';
+      this.statusEl.classList.add('go-flash');
+      setTimeout(() => this.statusEl.classList.remove('go-flash'), 1200);
+      return;
+    }
+    const prev = this.mode;
     this.mode = mode;
     this.engine.mode = mode;
     this.renderer.engine.mode = mode;
-    if (mode === 'scoring') {
-      if (!this.engine.gameOver) {
-        this.statusEl.textContent = 'Finish the game (two passes) to score.';
-      } else {
-        this.renderer.deadStones = [];
+    if (mode === 'play' && prev === 'edit') {
+      this.engine.beginPlay();
+      if (this.aiEnabled && this.humanColor === WHITE) {
+        this.scheduleAutoMove();
       }
+    }
+    if (mode === 'scoring') {
+      this.renderer.deadStones = [];
     }
     this._updateButtons();
     this._render();
@@ -240,8 +259,62 @@ export class GoEditor {
 
   toggleSuperko() {
     this.engine.setSuperko(!this.engine.superkoEnabled);
-    this._updateButtons();
+    if (this.superBtn) {
+      this.superBtn.dataset.on = String(this.engine.superkoEnabled);
+      this.superBtn.innerHTML = this.engine.superkoEnabled ? 'ON' : 'OFF';
+    }
     this._render();
+  }
+
+  get aiColor() {
+    return this.humanColor === BLACK ? WHITE : BLACK;
+  }
+
+  _humanLabel() {
+    return `Play ${this.humanColor === BLACK ? '■ Black' : '○ White'}`;
+  }
+
+  _aiLabel() {
+    return this.aiEnabled ? 'AI ○ ON' : 'AI OFF';
+  }
+
+  toggleHumanColor() {
+    this.humanColor = this.humanColor === BLACK ? WHITE : BLACK;
+    if (this.humanBtn) this.humanBtn.textContent = this._humanLabel();
+  }
+
+  toggleAI() {
+    this.aiEnabled = !this.aiEnabled;
+    if (this.aiBtn) {
+      this.aiBtn.dataset.on = String(this.aiEnabled);
+      this.aiBtn.textContent = this._aiLabel();
+    }
+    this._render();
+  }
+
+  scheduleAutoMove() {
+    if (this._aiScheduled) return;
+    this._aiScheduled = true;
+    setTimeout(() => {
+      this._aiScheduled = false;
+      this.autoMove();
+    }, 300);
+  }
+
+  autoMove() {
+    if (this.mode !== 'play' || this.engine.gameOver || !this.aiEnabled) return;
+    if (this.engine.turn !== this.aiColor) return;
+    const move = selectMove(this.engine, this.aiColor, 2);
+    if (!move) {
+      this.engine.pass();
+    } else {
+      const res = this.engine.playMove(move.r, move.c);
+      if (!res.legal) this.engine.pass();
+    }
+    this._render();
+    if (!this.engine.gameOver && this.engine.turn === this.aiColor) {
+      this.scheduleAutoMove();
+    }
   }
 
   undo() {
@@ -259,8 +332,14 @@ export class GoEditor {
   pass() {
     if (this.mode !== 'play' || this.engine.gameOver) return;
     this.engine.pass();
-    this._updateButtons();
     this._render();
+    this._afterHumanAction();
+  }
+
+  _afterHumanAction() {
+    if (this.aiEnabled && !this.engine.gameOver && this.engine.turn === this.aiColor) {
+      this.scheduleAutoMove();
+    }
   }
 
   reset() {
@@ -269,6 +348,13 @@ export class GoEditor {
     this.mode = 'edit';
     this.engine.mode = this.mode;
     this.renderer.engine.mode = this.mode;
+    this.humanColor = BLACK;
+    this.aiEnabled = true;
+    if (this.humanBtn) this.humanBtn.textContent = this._humanLabel();
+    if (this.aiBtn) {
+      this.aiBtn.dataset.on = String(this.aiEnabled);
+      this.aiBtn.textContent = this._aiLabel();
+    }
     this._updateButtons();
     this._render();
   }
@@ -280,7 +366,7 @@ export class GoEditor {
     for (const b of this.container.querySelectorAll('.go-size-btn')) {
       b.classList.toggle('active', Number(b.dataset.size) === this.engine.size);
     }
-    const sup = this.container.querySelector('.go-toggle');
+    const sup = this.superBtn;
     if (sup) sup.dataset.on = String(this.engine.superkoEnabled);
     const undoBtn = this.container.querySelector('.go-undo');
     if (undoBtn) undoBtn.disabled = !this.engine.canUndo;
@@ -323,7 +409,7 @@ export class GoEditor {
 
   _render() {
     this._updateButtons();
-    this.renderer.draw();
+    this.renderer.redraw();
   }
 
   render() {
